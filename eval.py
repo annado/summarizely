@@ -1,64 +1,122 @@
-import openai
-from langsmith.wrappers import wrap_openai
-
-import requests
-from bs4 import BeautifulSoup
+from langchain_openai import ChatOpenAI
+from langsmith.evaluation import evaluate, LangChainStringEvaluator
+from langsmith.schemas import Run, Example
+from openai import OpenAI
+import json
 
 from dotenv import load_dotenv
 load_dotenv()
 
-url = "https://www.databricks.com/blog/introducing-dbrx-new-state-art-open-llm"
-response = requests.get(url)
-soup = BeautifulSoup(response.content, "html.parser")
-text = [p.text for p in soup.find_all("p")]
-full_text = "\n".join(text)
+from langsmith.wrappers import wrap_openai
+from langsmith import traceable
 
-openai_client = wrap_openai(openai.Client())
+client = wrap_openai(OpenAI())
 
-def answer_dbrx_question_oai(inputs: dict) -> dict:
-    """
-    Generates answers to user questions based on a provided website text using OpenAI API.
+@traceable
+def prompt_compliance_evaluator(run: Run, example: Example) -> dict:
+    inputs = example.inputs['input']
+    outputs = example.outputs['output']
 
-    Parameters:
-    inputs (dict): A dictionary with a single key 'question', representing the user's question as a string.
+    # Extract system prompt
+    system_prompt = next((msg['data']['content'] for msg in inputs if msg['type'] == 'system'), "")
 
-    Returns:
-    dict: A dictionary with a single key 'output', containing the generated answer as a string.
-    """
+    # Extract message history
+    message_history = []
+    for msg in inputs:
+        if msg['type'] in ['human', 'ai']:
+            message_history.append({
+                "role": "user" if msg['type'] == 'human' else "assistant",
+                "content": msg['data']['content']
+            })
 
-    # System prompt
-    system_msg = (
-        f"Answer user questions in 2-3 sentences about this context: \n\n\n {full_text}"
+    # Extract latest user message and model output
+    latest_message = message_history[-1]['content'] if message_history else ""
+    model_output = outputs['data']['content']
+
+    evaluation_prompt = f"""
+        System Prompt: {system_prompt}
+
+        Message History:
+        {json.dumps(message_history, indent=2)}
+
+        Latest User Message: {latest_message}
+
+        Model Output: {model_output}
+
+        Based on the above information, evaluate the model's output for compliance with the system prompt and context of the conversation. 
+        Provide a score from 0 to 10, where 0 is completely non-compliant and 10 is perfectly compliant.
+        Also provide a brief explanation for your score.
+
+        Also, evaluate the model's output for how well organized and easy to follow the information is for a busy parent. 
+        Provide a score from 0 to 10, where 0 is completely not organized or difficult to follow and 10 is perfectly organized and extremely easy to follow.
+        Also provide a brief explanation for your score.
+
+        Respond in the following JSON format:
+        {{
+            "compliance": {{
+                "score": <int>,
+                "explanation": "<string>"
+            }},
+            "organization": {{
+                "score": <int>,
+                "explanation": "<string>"
+            }}
+        }}
+        """
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are an AI assistant tasked with evaluating the compliance of model outputs to given prompts and conversation context."},
+            {"role": "user", "content": evaluation_prompt}
+        ],
+        temperature=0.2
     )
 
-    # Pass in website text
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": inputs["question"]},
-    ]
+    try:
+        result = json.loads(response.choices[0].message.content)
+        return {
+            "results": [{
+                "key": "prompt_compliance",
+                "score": result["compliance"]["score"] / 10,  # Normalize to 0-1 range
+                "reason": result["compliance"]["explanation"]
+            },
+            {
+                "key": "organization_score",
+                "score": result["organization"]["score"] / 10,  # Normalize to 0-1 range
+                "reason": result["organization"]["explanation"]
+            }]
+        }
+    except json.JSONDecodeError:
+        return {
+            "results": [{
+                "key": "prompt_compliance",
+                "score": 0,
+                "reason": "Failed to parse evaluator response"
+            },
+            {
+                "key": "organization_score",
+                "score": 0,
+                "reason": "Failed to parse evaluator response"
+        }]}
 
-    # Call OpenAI
-    response = openai_client.chat.completions.create(
-        messages=messages, model="gpt-3.5-turbo"
-    )
+# The name or UUID of the LangSmith dataset to evaluate on.
+data = "Email Summarizer"
 
-    # Response in output dict
-    return {"answer": response.dict()["choices"][0]["message"]["content"]}
-  
-  
-from langsmith.evaluation import evaluate, LangChainStringEvaluator
+# A string to prefix the experiment name with.
+experiment_prefix = "Email summary prompt compliance"
 
-# Evaluators
-qa_evalulator = [LangChainStringEvaluator("cot_qa")]
-dataset_name = "DBRX"
+# List of evaluators to score the outputs of target task
+evaluators = [
+    prompt_compliance_evaluator
+]
 
-experiment_results = evaluate(
-    answer_dbrx_question_oai,
-    data=dataset_name,
-    evaluators=qa_evalulator,
-    experiment_prefix="test-dbrx-qa-oai",
-    # Any experiment metadata can be specified here
-    metadata={
-        "variant": "stuff website context into gpt-3.5-turbo",
-    },
+# Evaluate the target task
+results = evaluate(
+    lambda inputs: inputs,
+    data=data,
+    evaluators=evaluators,
+    experiment_prefix=experiment_prefix,
 )
+
+print(results)
