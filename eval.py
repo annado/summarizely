@@ -43,7 +43,7 @@ def prompt_compliance_evaluator(run: Run, example: Example) -> dict:
 
         Model Output: {model_output}
 
-        Based on the above information, evaluate the model's output for compliance with the system prompt and context of the conversation. 
+        Based on the above information, evaluate the model's output for compliance with the system prompt and context of the conversation without loss of information. 
         Provide a score from 0 to 10, where 0 is completely non-compliant and 10 is perfectly compliant.
         Also provide a brief explanation for your score.
 
